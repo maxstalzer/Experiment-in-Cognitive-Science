@@ -4,7 +4,7 @@ simple inter-subject correlations (ISC) of heart rate per music tempo.
 
 Usage:
     python sync_hr_isc.py                       # uses ./data, writes ./output
-    python sync_hr_isc.py --data data --out output --fs 4 --detrend
+    python sync_hr_isc.py --data data --out output --fs 10 --detrend
 
 Sync logic
 ----------
@@ -17,13 +17,16 @@ Sync logic
   complete run is covered by the shifted HR recording. The (run, offset) pair
   with the highest coverage wins; ties go to the smaller |offset| and then the
   later run. Use MANUAL_OFFSETS_H to override if needed.
+* HR files are matched to participants by a "participant_NN" suffix. One
+  recording can hold several participants ("participant_08_09_10"); each is
+  synced to its own blocks.csv. Files without a suffix are skipped and listed.
 * Session timestamps are taken from date + start_local (PC local time), so
   both clocks are compared as naive local wall-clock times.
 
 ISC
 ---
 For each segment (baseline, block per BPM, rest after each block) the HR
-(60000 / RR) is linearly interpolated to a common grid (default 4 Hz) from
+(60000 / RR) is linearly interpolated to a common grid (default 10 Hz) from
 segment onset to the shortest common segment duration. Interpolation is
 needed because beats occur at different times/rates per participant, and
 Pearson r requires time-matched samples. For each condition we report
@@ -48,13 +51,16 @@ MAX_H = 3                    # search offsets -MAX_H..+MAX_H hours
 MIN_BLOCKS = 3               # a complete run must have at least this many blocks
 MIN_COVERAGE = 0.95          # required HR coverage of a run to accept the sync
 MAX_GAP_S = 3.0              # segments with a beat gap longer than this get flagged
-MANUAL_OFFSETS_H: dict[int, float] = {}   # e.g. {2: 2.0} to force participant 2
+# Force the device-clock offset per participant. 8-10 share one recording with
+# three good stretches; by time span alone p10 fits at +2 h and +3 h, but at
+# +3 h its session lands in an off-body gap.
+MANUAL_OFFSETS_H: dict[int, float] = {8: 2.0, 9: 2.0, 10: 2.0}
 
 
 # --------------------------------------------------------------------------- IO
 @dataclass
 class HRRecording:
-    pid: int
+    pids: list[int]          # one recording can hold several participants
     path: Path
     start: datetime          # naive, device-local
     beat_t: np.ndarray       # seconds since start, time of each beat
@@ -66,11 +72,13 @@ class HRRecording:
         return float(self.beat_t[-1]) if len(self.beat_t) else 0.0
 
 
-def read_hr(path: Path) -> HRRecording:
-    m = re.search(r"participant_(\d+)", path.stem)
-    if not m:
-        raise ValueError(f"cannot find participant id in {path.name}")
-    pid = int(m.group(1))
+def parse_pids(path: Path) -> list[int]:
+    """'..._participant_08_09_10' -> [8, 9, 10]; no suffix -> []."""
+    m = re.search(r"participant_(\d+(?:_\d+)*)", path.stem)
+    return [int(x) for x in m.group(1).split("_")] if m else []
+
+
+def read_hr(path: Path, pids: list[int]) -> HRRecording:
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     start_line = next(l for l in lines if l.lower().startswith("start time"))
     start = datetime.strptime(start_line.split(":", 1)[1].strip(), "%d.%m.%Y %H:%M:%S")
@@ -84,7 +92,7 @@ def read_hr(path: Path) -> HRRecording:
     d_raw, d_corr = rr_raw.sum() / 1000, rr_corr.sum() / 1000
     if abs(d_raw - d_corr) > 2.0:
         print(f"[warn] {path.name}: raw {d_raw:.1f}s vs corrected {d_corr:.1f}s duration")
-    return HRRecording(pid, path, start, beat_t, rr_corr, art != 0)
+    return HRRecording(pids, path, start, beat_t, rr_corr, art != 0)
 
 
 def read_blocks(pdir: Path) -> pd.DataFrame:
@@ -114,11 +122,11 @@ def coverage(rec: HRRecording, run: pd.DataFrame, offset_h: float) -> float:
     return max(ov, 0.0) / (r1 - r0).total_seconds()
 
 
-def sync(rec: HRRecording, blocks: pd.DataFrame) -> tuple[pd.DataFrame, float, float, list]:
+def sync(rec: HRRecording, pid: int, blocks: pd.DataFrame) -> tuple[pd.DataFrame, float, float, list]:
     runs = complete_runs(blocks)
     if not runs:
         raise RuntimeError("no complete run in blocks.csv")
-    offsets = ([MANUAL_OFFSETS_H[rec.pid]] if rec.pid in MANUAL_OFFSETS_H
+    offsets = ([MANUAL_OFFSETS_H[pid]] if pid in MANUAL_OFFSETS_H
                else list(range(-MAX_H, MAX_H + 1)))
     cands = []
     for ri, run in enumerate(runs):
@@ -168,7 +176,7 @@ def main():
     here = Path(__file__).resolve().parent
     ap.add_argument("--data", type=Path, default=here / "data")
     ap.add_argument("--out", type=Path, default=here / "output")
-    ap.add_argument("--fs", type=float, default=4.0, help="resampling rate (Hz)")
+    ap.add_argument("--fs", type=float, default=10.0, help="resampling rate (Hz)")
     ap.add_argument("--detrend", action="store_true",
                     help="remove linear trend per segment before ISC")
     args = ap.parse_args()
@@ -177,46 +185,57 @@ def main():
     sync_rows, seg_rows, long_rows = [], [], []
     series = {}   # (condition_label) -> {pid: (grid, hr)}
 
+    unlabelled = []
     for f in sorted((args.data / "raw_hr").glob("*.csv")):
-        rec = read_hr(f)
-        pdir = args.data / f"participant-{rec.pid:02d}"
-        if not pdir.exists():
-            print(f"[skip] {f.name}: no {pdir.name}")
+        pids = parse_pids(f)
+        if not pids:
+            unlabelled.append(f.name)
             continue
-        run, h, cov, cands = sync(rec, read_blocks(pdir))
-        alt = [c for c in cands if c[0] > 0 and (c[2], c[3]) != (cands[0][2], cands[0][3])]
-        status = "ok" if cov >= MIN_COVERAGE else "LOW_COVERAGE"
-        print(f"P{rec.pid:02d}: HR start {rec.start}  dur {rec.duration_s:6.1f}s  "
-              f"offset {h:+.0f} h  run {run['start_dt'].min():%Y-%m-%d %H:%M:%S}"
-              f"-{run['stop_dt'].max():%H:%M:%S}  coverage {cov:.0%}  [{status}]")
-        sync_rows.append(dict(
-            participant=rec.pid, hr_file=f.name, hr_start_device=rec.start,
-            hr_duration_s=rec.duration_s, offset_h=h,
-            hr_start_aligned=rec.start + timedelta(hours=h),
-            run_start=run["start_dt"].min(), run_stop=run["stop_dt"].max(),
-            run_coverage=cov, status=status,
-            runner_up=(f"cov={alt[0][0]:.2f} offset={alt[0][3]:+d}h" if alt else ""),
-            artifact_pct_total=100 * rec.artifact.mean()))
-        if status != "ok":
-            continue
+        rec = read_hr(f, pids)
+        for pid in pids:
+            pdir = args.data / f"participant-{pid:02d}"
+            if not pdir.exists():
+                print(f"[skip] {f.name}: no {pdir.name}")
+                continue
+            run, h, cov, cands = sync(rec, pid, read_blocks(pdir))
+            alt = [c for c in cands if c[0] > 0 and (c[2], c[3]) != (cands[0][2], cands[0][3])]
+            status = "ok" if cov >= MIN_COVERAGE else "LOW_COVERAGE"
+            print(f"P{pid:02d}: HR start {rec.start}  dur {rec.duration_s:6.1f}s  "
+                  f"offset {h:+.0f} h  run {run['start_dt'].min():%Y-%m-%d %H:%M:%S}"
+                  f"-{run['stop_dt'].max():%H:%M:%S}  coverage {cov:.0%}  [{status}]")
+            sync_rows.append(dict(
+                participant=pid, hr_file=f.name, hr_start_device=rec.start,
+                hr_duration_s=rec.duration_s, offset_h=h,
+                hr_start_aligned=rec.start + timedelta(hours=h),
+                run_start=run["start_dt"].min(), run_stop=run["stop_dt"].max(),
+                run_coverage=cov, status=status,
+                runner_up=(f"cov={alt[0][0]:.2f} offset={alt[0][3]:+d}h" if alt else ""),
+                artifact_pct_total=100 * rec.artifact.mean()))
+            if status != "ok":
+                continue
 
-        for _, s in run.iterrows():
-            seg = s["segment"]
-            bi = int(s["block_index"]) if pd.notna(s["block_index"]) else 0
-            if seg == "block":
-                bpm = int(s["condition_bpm"])
-                label = f"music_{bpm}"
-            elif seg == "rest":
-                prev = run[(run["segment"] == "block") & (run["block_index"] == bi)]
-                bpm = int(prev["condition_bpm"].iloc[0])
-                label = f"rest_after_{bpm}"
-            else:
-                bpm, label = np.nan, seg
-            seg_rows.append(dict(participant=rec.pid, segment=seg, label=label,
-                                 block_index=bi or np.nan, condition_bpm=bpm,
-                                 start=s["start_dt"], stop=s["stop_dt"],
-                                 duration_s=s["duration_s"]))
-            series.setdefault(label, {})[rec.pid] = (s["start_dt"], s["duration_s"], rec, h, bi)
+            for _, s in run.iterrows():
+                seg = s["segment"]
+                bi = int(s["block_index"]) if pd.notna(s["block_index"]) else 0
+                if seg == "block":
+                    bpm = int(s["condition_bpm"])
+                    label = f"music_{bpm}"
+                elif seg == "rest":
+                    prev = run[(run["segment"] == "block") & (run["block_index"] == bi)]
+                    bpm = int(prev["condition_bpm"].iloc[0])
+                    label = f"rest_after_{bpm}"
+                else:
+                    bpm, label = np.nan, seg
+                seg_rows.append(dict(participant=pid, segment=seg, label=label,
+                                     block_index=bi or np.nan, condition_bpm=bpm,
+                                     start=s["start_dt"], stop=s["stop_dt"],
+                                     duration_s=s["duration_s"]))
+                series.setdefault(label, {})[pid] = (s["start_dt"], s["duration_s"], rec, h, bi)
+
+    if unlabelled:
+        print(f"\n[skip] {len(unlabelled)} HR file(s) without a participant_NN suffix:")
+        for name in unlabelled:
+            print(f"  {name}")
 
     pd.DataFrame(sync_rows).to_csv(args.out / "sync_report.csv", index=False)
 
